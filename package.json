@@ -1,12 +1,13 @@
 {
   "name": "ig-dm-bot",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "main": "index.js",
   "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
+    "better-sqlite3": "^9.4.3",
     "express": "^4.18.2"
   }
 }
