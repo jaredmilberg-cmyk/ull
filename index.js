@@ -1,142 +1,235 @@
 
 'use strict';
 
-const express = require('express');
-const app = express();
-app.use(express.json());
+// ─── Dependencies ─────────────────────────────────────────────────────────────
+const express  = require('express');
+const Database = require('better-sqlite3');
+const path     = require('path');
 
-// ─── In-Memory State ──────────────────────────────────────────────────────────
-// sessions[user_id] = { step: 0|1|2, lastReplyAt: timestamp }
-const sessions = {};
+// ─── Database Setup ───────────────────────────────────────────────────────────
+// SQLite file lives next to index.js. On Render, use a persistent disk path
+// by setting the DB_PATH env var (e.g. /var/data/sessions.db).
+// Without a persistent disk the file resets on deploy — add one in Render's
+// dashboard under your service → Disks (free tier supports 1 GB).
+const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'sessions.db');
+const db = new Database(DB_PATH);
 
-// ─── Duplicate-reply guard: 20-second cooldown per user ──────────────────────
-const COOLDOWN_MS = 20_000;
+// Enable WAL mode: much faster concurrent reads/writes, safer crash recovery.
+db.pragma('journal_mode = WAL');
 
-function isDuplicate(userId) {
-  const session = sessions[userId];
-  if (!session || !session.lastReplyAt) return false;
-  return Date.now() - session.lastReplyAt < COOLDOWN_MS;
+// Create sessions table if it doesn't exist yet.
+db.exec(`
+  CREATE TABLE IF NOT EXISTS sessions (
+    user_id      TEXT    PRIMARY KEY,
+    step         INTEGER NOT NULL DEFAULT 0,
+    last_service TEXT,
+    last_reply_at INTEGER
+  )
+`);
+
+// ─── Prepared Statements (compiled once, reused on every request) ─────────────
+const stmtGet    = db.prepare('SELECT * FROM sessions WHERE user_id = ?');
+const stmtUpsert = db.prepare(`
+  INSERT INTO sessions (user_id, step, last_service, last_reply_at)
+  VALUES (@user_id, @step, @last_service, @last_reply_at)
+  ON CONFLICT(user_id) DO UPDATE SET
+    step          = excluded.step,
+    last_service  = excluded.last_service,
+    last_reply_at = excluded.last_reply_at
+`);
+
+// ─── Session Helpers ──────────────────────────────────────────────────────────
+const DEFAULT_SESSION = { step: 0, last_service: null, last_reply_at: null };
+
+/** Read session from DB. Returns a plain object — never null. */
+function getSession(userId) {
+  const row = stmtGet.get(userId);
+  if (!row) return { ...DEFAULT_SESSION, user_id: userId };
+  return row;
 }
 
-function touchReply(userId) {
-  if (!sessions[userId]) sessions[userId] = { step: 0, lastReplyAt: null };
-  sessions[userId].lastReplyAt = Date.now();
+/** Persist a full session object back to DB. */
+function saveSession(session) {
+  stmtUpsert.run(session);
+}
+
+// ─── Duplicate-Reply Guard: 20-second cooldown ────────────────────────────────
+const COOLDOWN_MS = 20_000;
+
+function isDuplicate(session) {
+  if (!session.last_reply_at) return false;
+  return Date.now() - session.last_reply_at < COOLDOWN_MS;
+}
+
+// ─── Input Normalisation ──────────────────────────────────────────────────────
+function normalise(text) {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// ─── Trigger Detection ────────────────────────────────────────────────────────
+function isQuoteTrigger(text) {
+  return /^quote\.?$/i.test(text.trim());
+}
+
+function isInstructionsTrigger(text) {
+  return /^instructions\.?$/i.test(text.trim());
 }
 
 // ─── Service Prices ───────────────────────────────────────────────────────────
 const PRICES = {
-  'Lawn Mowing – Front & Back': '$125',
-  'Lawn Mowing + Weed Control – Front Yard': '$130',
-  'Lawn Mowing + Weed Control – Backyard': '$130',
-  'Lawn Mowing + Weed Control – Front & Back': '$165',
-  'Lawn Mowing – Front & Back (Subscription/Recurring)': '$125',
-  'Lawn Mowing + Weed Control – Front Yard (Subscription/Recurring)': '$130',
-  'Lawn Mowing + Weed Control – Backyard (Subscription/Recurring)': '$130',
-  'Lawn Mowing + Weed Control – Front & Back (Subscription/Recurring)': '$165',
-  'Branch & Debris Removal – Front Yard': '$200',
-  'Branch & Debris Removal – Backyard': '$210',
-  'Branch & Debris Removal – Front & Back': '$365',
-  'Branch & Debris Removal – Front Yard (Heavy Duty)': '$350',
-  'Branch & Debris Removal – Backyard (Heavy Duty)': '$365',
-  'Branch & Debris Removal – Front & Back (Heavy Duty)': '$730',
+  'Lawn Mowing – Front & Back':                                         '$125',
+  'Lawn Mowing + Weed Control – Front Yard':                           '$130',
+  'Lawn Mowing + Weed Control – Backyard':                             '$130',
+  'Lawn Mowing + Weed Control – Front & Back':                         '$165',
+  'Lawn Mowing – Front & Back (Subscription/Recurring)':               '$125',
+  'Lawn Mowing + Weed Control – Front Yard (Subscription/Recurring)':  '$130',
+  'Lawn Mowing + Weed Control – Backyard (Subscription/Recurring)':    '$130',
+  'Lawn Mowing + Weed Control – Front & Back (Subscription/Recurring)':'$165',
+  'Branch & Debris Removal – Front Yard':                              '$200',
+  'Branch & Debris Removal – Backyard':                                '$210',
+  'Branch & Debris Removal – Front & Back':                            '$365',
+  'Branch & Debris Removal – Front Yard (Heavy Duty)':                 '$350',
+  'Branch & Debris Removal – Backyard (Heavy Duty)':                   '$365',
+  'Branch & Debris Removal – Front & Back (Heavy Duty)':               '$730',
 };
 
-// ─── Message Templates ────────────────────────────────────────────────────────
-const SERVICE_MENU = `Which service do you want the instant quote for?
-(TYPE THE EXACT SERVICE YOU WANT AS YOUR REPLY)
+// ─── Safe Service Matching ────────────────────────────────────────────────────
+// Pass 1 — exact normalised match (safest).
+// Pass 2 — user input contains the full service name (handles minor noise).
+// No reverse fuzzy — prevents wrong-service matches.
+function findService(input) {
+  const normInput = normalise(input);
 
-Lawn Mowing – Front & Back
-Lawn Mowing + Weed Control – Front Yard
-Lawn Mowing + Weed Control – Backyard
-Lawn Mowing + Weed Control – Front & Back
-Lawn Mowing – Front & Back (Subscription/Recurring)
-Lawn Mowing + Weed Control – Front Yard (Subscription/Recurring)
-Lawn Mowing + Weed Control – Backyard (Subscription/Recurring)
-Lawn Mowing + Weed Control – Front & Back (Subscription/Recurring)
-Branch & Debris Removal – Front Yard
-Branch & Debris Removal – Backyard
-Branch & Debris Removal – Front & Back
-Branch & Debris Removal – Front Yard (Heavy Duty)
-Branch & Debris Removal – Backyard (Heavy Duty)
-Branch & Debris Removal – Front & Back (Heavy Duty)`;
-
-const BOOKING_MESSAGE = `You can book instantly through our site by choosing your preferred time and date:
-https://urban-leaf-landscaping.base44.app/Services
-
-Use coupon code ULL40 at checkout for $40 off your first service.
-
-After booking, you will receive a confirmation email.
-
-We look forward to getting to work! 🌿
-— Urban Leaf Landscaping`;
-
-// ─── Helper: get or initialise session ───────────────────────────────────────
-function getSession(userId) {
-  if (!sessions[userId]) {
-    sessions[userId] = { step: 0, lastReplyAt: null };
+  for (const [label, price] of Object.entries(PRICES)) {
+    if (normInput === normalise(label)) return { label, price };
   }
-  return sessions[userId];
+
+  for (const [label, price] of Object.entries(PRICES)) {
+    if (normInput.includes(normalise(label))) return { label, price };
+  }
+
+  return null;
 }
 
+// ─── Message Templates ────────────────────────────────────────────────────────
+const SERVICE_MENU = `What service would you like a quote for?
+
+• Lawn Mowing – Front & Back
+• Lawn Mowing + Weed Control – Front Yard
+• Lawn Mowing + Weed Control – Backyard
+• Lawn Mowing + Weed Control – Front & Back
+• Lawn Mowing – Front & Back (Subscription/Recurring)
+• Lawn Mowing + Weed Control – Front Yard (Subscription/Recurring)
+• Lawn Mowing + Weed Control – Backyard (Subscription/Recurring)
+• Lawn Mowing + Weed Control – Front & Back (Subscription/Recurring)
+• Branch & Debris Removal – Front Yard
+• Branch & Debris Removal – Backyard
+• Branch & Debris Removal – Front & Back
+• Branch & Debris Removal – Front Yard (Heavy Duty)
+• Branch & Debris Removal – Backyard (Heavy Duty)
+• Branch & Debris Removal – Front & Back (Heavy Duty)
+
+TO SELECT THE SERVICE YOU WANT, REPLY WITH THE NAME OF THE SERVICE EXACTLY.`;
+
+function buildQuoteReply(price) {
+  return `For this service the price is ${price}.
+
+Right now you can get $40 off the service you just selected for the next 30 minutes if you book right now on our site.
+
+Use coupon code: 40ULL
+Book here: https://urban-leaf-landscaping.base44.app/Services
+
+Thanks and we look forward to serving you.
+
+(Note: if you are booking and need further instructions on what to do, reply "instructions" and we will guide you through the booking process)`;
+}
+
+const INSTRUCTIONS_MESSAGE = `Here's how to complete your booking:
+
+1. Upon visiting the website, select the service you were just quoted for. By clicking on the three sections (Snow Removal, Lawn Care, or Yard Cleanup) a drop-down of available services will appear — select the one you were quoted for.
+
+2. Hit "Book and Schedule" at the bottom after selecting your service. Fill in your details, continue to the calendar, and select a day and time. If this is a subscription, we will aim to return at this time for the frequency you selected.
+   Example: Lawn mowing scheduled for May 7th 3:00pm → next visit May 14th 3:00pm.
+
+3. You will then be redirected to pay using Stripe. Remember to use coupon code 40ULL at checkout for $40 off if booked within 30 minutes of receiving this offer.
+
+Upon paying, you will receive a confirmation email of your purchase and upcoming appointment with Urban Leaf Landscaping.
+
+We look forward to helping you. 🌿`;
+
+const NO_MATCH_MESSAGE =
+  `I couldn't match that service exactly. Please select one from the list and reply with the name exactly as shown:\n\n${SERVICE_MENU}`;
+
+const INSTRUCTIONS_TOO_EARLY_MESSAGE =
+  `Please send "quote" first to get a price — I'll guide you through booking after that.`;
+
 // ─── Core Logic ───────────────────────────────────────────────────────────────
+// All DB reads/writes use better-sqlite3's synchronous API, so no async needed.
+// better-sqlite3 is deliberately synchronous — it's safe and fast for this use case.
 function handleMessage(userId, text) {
   const session = getSession(userId);
-  const trimmed = text.trim();
+  const raw     = text.trim();
 
-  // Step 0 – waiting for keyword
-  if (session.step === 0) {
-    if (/quote/i.test(trimmed)) {
-      session.step = 1;
-      return { reply: SERVICE_MENU };
+  // ── INSTRUCTIONS trigger ──────────────────────────────────────────────────
+  if (isInstructionsTrigger(raw)) {
+    if (session.step >= 2) {
+      // No state change needed — just reply
+      return { reply: INSTRUCTIONS_MESSAGE };
     }
-    // Not the right keyword – ignore silently (no reply)
-    return null;
+    return { reply: INSTRUCTIONS_TOO_EARLY_MESSAGE };
   }
 
-  // Step 1 – waiting for service selection
-  if (session.step === 1) {
-    const price = PRICES[trimmed];
-    if (price) {
-      session.step = 2;
-      // Return both messages joined; Base44 can split on "\n\n---\n\n" or just
-      // deliver them as one block. Adjust if Base44 supports multi-message.
-      const priceMsg = `The price for "${trimmed}" is ${price}.`;
-      return {
-        reply: priceMsg,
-        followUp: BOOKING_MESSAGE,
-      };
-    }
-    // Unrecognised service – prompt again
-    return {
-      reply: `Sorry, I didn't recognise that service. Please type the service name exactly as shown:\n\n${SERVICE_MENU}`,
-    };
-  }
-
-  // Step 2 – conversation complete
-  // Reset so the user can start a new quote flow
-  if (/quote/i.test(trimmed)) {
-    session.step = 1;
-    session.lastReplyAt = null; // allow immediate reply
+  // ── QUOTE trigger — (re)starts the flow ──────────────────────────────────
+  if (isQuoteTrigger(raw)) {
+    saveSession({
+      user_id:       userId,
+      step:          1,
+      last_service:  null,
+      last_reply_at: null, // clear cooldown so the menu always goes out
+    });
     return { reply: SERVICE_MENU };
   }
 
-  return null; // no action
+  // ── Step 1: waiting for service selection ─────────────────────────────────
+  if (session.step === 1) {
+    const match = findService(raw);
+
+    if (match) {
+      saveSession({
+        user_id:       userId,
+        step:          2,
+        last_service:  match.label,
+        last_reply_at: Date.now(),
+      });
+      return { reply: buildQuoteReply(match.price) };
+    }
+
+    return { reply: NO_MATCH_MESSAGE };
+  }
+
+  // ── Step 0 / Step 2: only quote or instructions trigger a response ─────────
+  return null;
 }
 
-// ─── POST /webhook ────────────────────────────────────────────────────────────
+// ─── Express App ──────────────────────────────────────────────────────────────
+const app = express();
+app.use(express.json());
+
+// POST /webhook — incoming Instagram DM
 app.post('/webhook', (req, res) => {
   try {
-    const body = req.body;
-
-    // Validate basic payload shape
-    const entry = body?.entry?.[0];
+    const entry     = req.body?.entry?.[0];
     const messaging = entry?.messaging?.[0];
 
     if (!messaging) {
       return res.status(400).json({ error: 'Invalid payload: missing entry.messaging' });
     }
 
-    const userId = messaging?.sender?.id;
+    const userId      = messaging?.sender?.id;
     const messageText = messaging?.message?.text;
 
     if (!userId) {
@@ -144,12 +237,13 @@ app.post('/webhook', (req, res) => {
     }
 
     if (!messageText) {
-      // Could be a reaction, story reply, etc. — acknowledge and skip
+      // Reaction, story reply, sticker, etc.
       return res.status(200).json({ status: 'ignored', reason: 'no text in message' });
     }
 
-    // Duplicate-reply guard
-    if (isDuplicate(userId)) {
+    // Cooldown check — read from DB
+    const existingSession = getSession(userId);
+    if (isDuplicate(existingSession)) {
       console.log(`[COOLDOWN] Skipping duplicate reply for user ${userId}`);
       return res.status(200).json({ status: 'skipped', reason: 'cooldown active' });
     }
@@ -157,25 +251,15 @@ app.post('/webhook', (req, res) => {
     const result = handleMessage(userId, messageText);
 
     if (!result) {
-      // No reply needed
       return res.status(200).json({ status: 'no_action' });
     }
 
-    touchReply(userId);
+    // Stamp cooldown on the persisted session (handleMessage may have already
+    // saved a new session; we update last_reply_at without overwriting step).
+    const updatedSession = getSession(userId);
+    saveSession({ ...updatedSession, last_reply_at: Date.now() });
 
-    // If there's a follow-up (price + booking link), combine into one response
-    // with a clear separator that Base44 / your integration layer can split.
-    // Alternatively, return both as an array of replies.
-    if (result.followUp) {
-      console.log(`[REPLY] user=${userId} step=price+booking`);
-      return res.status(200).json({
-        replies: [result.reply, result.followUp],
-        // Convenience: single string version (separated by double newline)
-        reply: `${result.reply}\n\n${result.followUp}`,
-      });
-    }
-
-    console.log(`[REPLY] user=${userId}`);
+    console.log(`[REPLY] user=${userId} step=${getSession(userId).step}`);
     return res.status(200).json({ reply: result.reply });
 
   } catch (err) {
@@ -184,14 +268,12 @@ app.post('/webhook', (req, res) => {
   }
 });
 
-// ─── GET /webhook – Meta verification challenge ───────────────────────────────
-// Meta sends a GET to verify the webhook URL. Handle it here if you ever
-// connect this server directly to Meta (not via Base44).
+// GET /webhook — Meta webhook verification challenge
 app.get('/webhook', (req, res) => {
   const VERIFY_TOKEN = process.env.META_VERIFY_TOKEN || 'urban_leaf_verify_token';
-  const mode = req.query['hub.mode'];
-  const token = req.query['hub.verify_token'];
-  const challenge = req.query['hub.challenge'];
+  const mode         = req.query['hub.mode'];
+  const token        = req.query['hub.verify_token'];
+  const challenge    = req.query['hub.challenge'];
 
   if (mode === 'subscribe' && token === VERIFY_TOKEN) {
     console.log('[WEBHOOK] Meta verification challenge accepted');
@@ -200,15 +282,17 @@ app.get('/webhook', (req, res) => {
   return res.status(403).json({ error: 'Forbidden' });
 });
 
-// ─── Health check ─────────────────────────────────────────────────────────────
+// GET /health — uptime / session count check
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', activeSessions: Object.keys(sessions).length });
+  const { count } = db.prepare('SELECT COUNT(*) AS count FROM sessions').get();
+  res.json({ status: 'ok', totalSessions: count, dbPath: DB_PATH });
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅  Urban Leaf Webhook API running on port ${PORT}`);
+  console.log(`💾  SQLite database: ${DB_PATH}`);
 });
 
-module.exports = app; // exported for testing
+module.exports = app;
