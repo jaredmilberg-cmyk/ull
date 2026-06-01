@@ -215,12 +215,32 @@ function handleMessage(userId, text) {
   return null;
 }
 
+// ─── Meta Messenger Send ──────────────────────────────────────────────────────
+// Sends a DM reply back to the user via the Instagram Graph API.
+// Requires PAGE_ACCESS_TOKEN to be set as an environment variable on Render.
+async function sendMessage(userId, text) {
+  const url = `https://graph.facebook.com/v19.0/me/messages?access_token=${process.env.PAGE_ACCESS_TOKEN}`;
+  const res = await fetch(url, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({
+      recipient: { id: userId },
+      message:   { text },
+    }),
+  });
+
+  if (!res.ok) {
+    const errBody = await res.text();
+    console.error(`[SEND ERROR] user=${userId} status=${res.status} body=${errBody}`);
+  }
+}
+
 // ─── Express App ──────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json());
 
 // POST /webhook — incoming Instagram DM
-app.post('/webhook', (req, res) => {
+app.post('/webhook', async (req, res) => {
   try {
     const entry     = req.body?.entry?.[0];
     const messaging = entry?.messaging?.[0];
@@ -260,7 +280,8 @@ app.post('/webhook', (req, res) => {
     saveSession({ ...updatedSession, last_reply_at: Date.now() });
 
     console.log(`[REPLY] user=${userId} step=${getSession(userId).step}`);
-    return res.status(200).json({ reply: result.reply });
+    await sendMessage(userId, result.reply);
+    return res.sendStatus(200);
 
   } catch (err) {
     console.error('[ERROR]', err);
