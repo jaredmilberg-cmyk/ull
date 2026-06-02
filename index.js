@@ -1,4 +1,3 @@
-
 'use strict';
 
 // ─── Dependencies ─────────────────────────────────────────────────────────────
@@ -219,13 +218,14 @@ function handleMessage(userId, text) {
 // Sends a DM reply back to the user via the Instagram Graph API.
 // Requires PAGE_ACCESS_TOKEN to be set as an environment variable on Render.
 async function sendMessage(userId, text) {
-  const IG_ID = "17841469474337726";
-
-  const url = `https://graph.facebook.com/v19.0/${IG_ID}/messages?access_token=${process.env.PAGE_ACCESS_TOKEN}`;
+  const url = `https://graph.facebook.com/v25.0/me/messages`;
 
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${process.env.PAGE_ACCESS_TOKEN}`,
+    },
     body: JSON.stringify({
       recipient: { id: userId },
       message: { text }
